@@ -1,4 +1,4 @@
-# server.py - Fixed Human Takeover with Audio Routing
+# server.py - Fixed Human Takeover with Audio Routing + ElevenLabs Integration
 import os
 import json
 import time
@@ -203,15 +203,6 @@ async def human_audio_stream(websocket: WebSocket, call_sid: str):
                         audio_base64,
                         connection_manager
                     )
-                    
-                    # ✅ DO NOT BROADCAST - Dashboard shouldn't hear itself
-                    # broadcast_to_dashboards_nonblocking({
-                    #     "messageType": "audio",
-                    #     "speaker": "Human",
-                    #     "audio": audio_base64,
-                    #     "timestamp": int(time.time() * 1000),
-                    #     "callSid": call_sid
-                    # }, call_sid)
                     
     except WebSocketDisconnect:
         Log.info(f"[HumanAudio] Disconnected for call {call_sid}")
@@ -422,7 +413,7 @@ async def handle_media_stream(websocket: WebSocket):
     order_extractor = OrderExtractionService()
     transcription_service = TranscriptionService()
     
-    # ✅ NEW: Initialize ElevenLabs services
+    # ✅ Initialize ElevenLabs services
     from services.elevenlabs_service import get_elevenlabs_service, get_text_buffer
     elevenlabs_service = get_elevenlabs_service()
     text_buffer = get_text_buffer()
@@ -543,7 +534,7 @@ async def handle_media_stream(websocket: WebSocket):
                         except Exception as e:
                             Log.error(f"[media] failed to stream caller audio: {e}")
 
-        # ✅ NEW: Handle TEXT deltas instead of audio deltas
+        # ✅ FIXED: Handle TEXT deltas and convert to ElevenLabs audio
         async def handle_text_delta(response: dict):
             """
             Handle TEXT response from OpenAI and convert to ElevenLabs voice.
@@ -557,28 +548,16 @@ async def handle_media_stream(websocket: WebSocket):
                 
                 etype = response.get('type')
                 
-                # Handle incremental text deltas (streaming text)
-                if etype == 'response.text.delta':
-                    delta = response.get('delta', '')
-                    if delta:
-                        Log.debug(f"[OpenAI→Text] Delta: '{delta}'")
-                        
-                        # Add to buffer and potentially send to ElevenLabs
-                        await text_buffer.add_text_delta(delta, connection_manager)
-                
-                # Handle complete text responses
-                elif etype == 'response.text.done':
-                    text = response.get('text', '')
-                    if text:
-                        Log.info(f"[OpenAI→Text] Complete: '{text[:60]}...'")
-                        
-                        # Send complete text to ElevenLabs
-                        await text_buffer.add_text_delta(text, connection_manager)
-                        await text_buffer.flush(connection_manager)
-                
-                # Handle response.done event (contains complete response)
-                elif etype == 'response.done':
+                # ✅ PRIMARY FIX: Handle response.done with text content
+                if etype == 'response.done':
                     resp = response.get('response') or {}
+                    
+                    # Check if response was completed successfully
+                    status = resp.get('status')
+                    if status != 'completed':
+                        Log.debug(f"[Text] Skipping non-completed response: {status}")
+                        return
+                    
                     output = resp.get('output') or []
                     
                     for item in output:
@@ -593,31 +572,56 @@ async def handle_media_stream(websocket: WebSocket):
                                 if not isinstance(c, dict):
                                     continue
                                 
-                                # Get text content
-                                if c.get('type') == 'text':
+                                # ✅ Get text from output_text (this is what OpenAI sends in text mode)
+                                if c.get('type') == 'output_text':
                                     text = c.get('text', '')
-                                    if text:
+                                    if text and text.strip():
                                         Log.info(f"[OpenAI→ElevenLabs] Converting: '{text[:60]}...'")
                                         
-                                        # Send to ElevenLabs for voice generation
-                                        await elevenlabs_service.send_to_twilio_realtime(
-                                            text,
-                                            connection_manager
-                                        )
+                                        # ✅ Send to ElevenLabs for voice generation
+                                        try:
+                                            await elevenlabs_service.send_to_twilio_realtime(
+                                                text,
+                                                connection_manager
+                                            )
+                                            Log.info(f"[OpenAI→ElevenLabs] ✅ Sent successfully")
+                                        except Exception as e:
+                                            Log.error(f"[OpenAI→ElevenLabs] Failed to send: {e}")
+                                            import traceback
+                                            Log.error(traceback.format_exc())
                                         
                                         # Broadcast transcript to dashboard
                                         if openai_service.ai_transcript_callback:
-                                            await openai_service.ai_transcript_callback({
-                                                "speaker": "AI",
-                                                "text": text,
-                                                "timestamp": int(time.time() * 1000)
-                                            })
-                    
-                    # Flush any remaining buffered text
-                    await text_buffer.flush(connection_manager)
+                                            try:
+                                                await openai_service.ai_transcript_callback({
+                                                    "speaker": "AI",
+                                                    "text": text,
+                                                    "timestamp": int(time.time() * 1000)
+                                                })
+                                            except Exception as e:
+                                                Log.error(f"Failed to broadcast transcript: {e}")
+                
+                # Handle incremental text deltas (if OpenAI sends them in streaming mode)
+                elif etype == 'response.text.delta':
+                    delta = response.get('delta', '')
+                    if delta:
+                        Log.debug(f"[OpenAI→Text] Delta: '{delta}'")
+                        # Add to buffer and potentially send to ElevenLabs
+                        await text_buffer.add_text_delta(delta, connection_manager)
+                
+                # Handle complete text responses (alternative format)
+                elif etype == 'response.text.done':
+                    text = response.get('text', '')
+                    if text:
+                        Log.info(f"[OpenAI→Text] Complete: '{text[:60]}...'")
+                        # Send complete text to ElevenLabs
+                        await text_buffer.add_text_delta(text, connection_manager)
+                        await text_buffer.flush(connection_manager)
                         
             except Exception as e:
                 Log.error(f"[Text→ElevenLabs] Error: {e}")
+                import traceback
+                Log.error(traceback.format_exc())
 
         async def handle_speech_started():
             """Handle user speech interruption."""
@@ -644,9 +648,8 @@ async def handle_media_stream(websocket: WebSocket):
        
         async def openai_receiver():
             """Receive and process OpenAI events."""
-            # ✅ Changed from handle_audio_delta to handle_text_delta
             await connection_manager.receive_from_openai(
-                handle_text_delta,  # ✅ NEW: Handle text instead of audio
+                handle_text_delta,  # ✅ Handle text instead of audio
                 handle_speech_started,
                 handle_other_openai_event,
             )
@@ -677,8 +680,8 @@ async def handle_media_stream(websocket: WebSocket):
                 "audio_service": audio_service,
                 "transcription_service": transcription_service,
                 "order_extractor": order_extractor,
-                "elevenlabs_service": elevenlabs_service,  # ✅ NEW
-                "text_buffer": text_buffer,  # ✅ NEW
+                "elevenlabs_service": elevenlabs_service,
+                "text_buffer": text_buffer,
                 "human_audio_ws": None
             }
             Log.info(f"[ActiveCalls] Registered call {current_call_sid}")
@@ -710,6 +713,8 @@ async def handle_media_stream(websocket: WebSocket):
 
     except Exception as e:
         Log.error(f"Error in media stream handler: {e}")
+        import traceback
+        Log.error(traceback.format_exc())
     finally:
         # Final order summary
         try:
