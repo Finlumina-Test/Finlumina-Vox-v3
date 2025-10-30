@@ -139,7 +139,7 @@ class OpenAISessionManager:
                             "model": "whisper-1",
                         }
                     },
-                    "output": {"format": {"type": "audio/pcmu"}}
+                  
                 },
 
                 "instructions": (
