@@ -25,6 +25,10 @@ class Config:
     TWILIO_ACCOUNT_SID: str | None = os.getenv('TWILIO_ACCOUNT_SID')
     TWILIO_AUTH_TOKEN: str | None = os.getenv('TWILIO_AUTH_TOKEN')
 
+    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+    ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
+    ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
+
     # AI Assistant Configuration
     SYSTEM_MESSAGE: str = (
         "You are a professional Pakistani voice assistant for "
