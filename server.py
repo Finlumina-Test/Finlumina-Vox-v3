@@ -422,6 +422,11 @@ async def handle_media_stream(websocket: WebSocket):
     order_extractor = OrderExtractionService()
     transcription_service = TranscriptionService()
     
+    # ✅ NEW: Initialize ElevenLabs services
+    from services.elevenlabs_service import get_elevenlabs_service, get_text_buffer
+    elevenlabs_service = get_elevenlabs_service()
+    text_buffer = get_text_buffer()
+    
     current_call_sid: Optional[str] = None
 
     # Audio streaming callback
@@ -471,6 +476,13 @@ async def handle_media_stream(websocket: WebSocket):
     openai_service.ai_transcript_callback = handle_openai_transcript
 
     try:
+        # ✅ Connect to ElevenLabs WebSocket
+        try:
+            await elevenlabs_service.connect()
+            Log.info("[ElevenLabs] ✅ Connected and ready")
+        except Exception as e:
+            Log.error(f"[ElevenLabs] Connection failed: {e}")
+        
         # Connect to OpenAI
         try:
             await connection_manager.connect_to_openai()
@@ -531,41 +543,81 @@ async def handle_media_stream(websocket: WebSocket):
                         except Exception as e:
                             Log.error(f"[media] failed to stream caller audio: {e}")
 
-        async def handle_audio_delta(response: dict):
-            """Handle audio response from OpenAI."""
+        # ✅ NEW: Handle TEXT deltas instead of audio deltas
+        async def handle_text_delta(response: dict):
+            """
+            Handle TEXT response from OpenAI and convert to ElevenLabs voice.
+            This replaces the old handle_audio_delta function.
+            """
             try:
-                # ✅ Skip AI audio if human has taken over
+                # Skip if human has taken over
                 if openai_service.is_human_in_control():
-                    Log.debug("[Audio] Skipping AI audio - human takeover active")
+                    Log.debug("[Text] Skipping AI text - human takeover active")
                     return
                 
-                audio_data = openai_service.extract_audio_response_data(response) or {}
-                delta = audio_data.get("delta")
+                etype = response.get('type')
                 
-                if delta:
-                    # Send to Twilio
-                    if getattr(connection_manager.state, "stream_sid", None):
-                        try:
-                            audio_message = audio_service.process_outgoing_audio(
-                                response, connection_manager.state.stream_sid
-                            )
-                            if audio_message:
-                                await connection_manager.send_to_twilio(audio_message)
-                                mark_msg = audio_service.create_mark_message(
-                                    connection_manager.state.stream_sid
-                                )
-                                await connection_manager.send_to_twilio(mark_msg)
-                        except Exception as e:
-                            Log.error(f"[audio->twilio] failed: {e}")
+                # Handle incremental text deltas (streaming text)
+                if etype == 'response.text.delta':
+                    delta = response.get('delta', '')
+                    if delta:
+                        Log.debug(f"[OpenAI→Text] Delta: '{delta}'")
+                        
+                        # Add to buffer and potentially send to ElevenLabs
+                        await text_buffer.add_text_delta(delta, connection_manager)
+                
+                # Handle complete text responses
+                elif etype == 'response.text.done':
+                    text = response.get('text', '')
+                    if text:
+                        Log.info(f"[OpenAI→Text] Complete: '{text[:60]}...'")
+                        
+                        # Send complete text to ElevenLabs
+                        await text_buffer.add_text_delta(text, connection_manager)
+                        await text_buffer.flush(connection_manager)
+                
+                # Handle response.done event (contains complete response)
+                elif etype == 'response.done':
+                    resp = response.get('response') or {}
+                    output = resp.get('output') or []
                     
-                    # Stream AI audio to dashboard
-                    try:
-                        await transcription_service.stream_audio_chunk(delta, source="AI")
-                    except Exception as e:
-                        Log.error(f"[audio->dashboard] failed: {e}")
+                    for item in output:
+                        if not isinstance(item, dict):
+                            continue
+                        
+                        # Extract text from message content
+                        if item.get('type') == 'message' and item.get('role') == 'assistant':
+                            content = item.get('content') or []
+                            
+                            for c in content:
+                                if not isinstance(c, dict):
+                                    continue
+                                
+                                # Get text content
+                                if c.get('type') == 'text':
+                                    text = c.get('text', '')
+                                    if text:
+                                        Log.info(f"[OpenAI→ElevenLabs] Converting: '{text[:60]}...'")
+                                        
+                                        # Send to ElevenLabs for voice generation
+                                        await elevenlabs_service.send_to_twilio_realtime(
+                                            text,
+                                            connection_manager
+                                        )
+                                        
+                                        # Broadcast transcript to dashboard
+                                        if openai_service.ai_transcript_callback:
+                                            await openai_service.ai_transcript_callback({
+                                                "speaker": "AI",
+                                                "text": text,
+                                                "timestamp": int(time.time() * 1000)
+                                            })
+                    
+                    # Flush any remaining buffered text
+                    await text_buffer.flush(connection_manager)
                         
             except Exception as e:
-                Log.error(f"[audio-delta] failed: {e}")
+                Log.error(f"[Text→ElevenLabs] Error: {e}")
 
         async def handle_speech_started():
             """Handle user speech interruption."""
@@ -573,6 +625,9 @@ async def handle_media_stream(websocket: WebSocket):
                 # ✅ Don't interrupt if human is in control
                 if not openai_service.is_human_in_control():
                     await connection_manager.send_mark_to_twilio()
+                    
+                    # ✅ Clear text buffer on interruption
+                    text_buffer.clear()
             except Exception:
                 pass
 
@@ -589,8 +644,9 @@ async def handle_media_stream(websocket: WebSocket):
        
         async def openai_receiver():
             """Receive and process OpenAI events."""
+            # ✅ Changed from handle_audio_delta to handle_text_delta
             await connection_manager.receive_from_openai(
-                handle_audio_delta,
+                handle_text_delta,  # ✅ NEW: Handle text instead of audio
                 handle_speech_started,
                 handle_other_openai_event,
             )
@@ -621,7 +677,9 @@ async def handle_media_stream(websocket: WebSocket):
                 "audio_service": audio_service,
                 "transcription_service": transcription_service,
                 "order_extractor": order_extractor,
-                "human_audio_ws": None  # Will be set when human connects
+                "elevenlabs_service": elevenlabs_service,  # ✅ NEW
+                "text_buffer": text_buffer,  # ✅ NEW
+                "human_audio_ws": None
             }
             Log.info(f"[ActiveCalls] Registered call {current_call_sid}")
 
@@ -666,6 +724,12 @@ async def handle_media_stream(websocket: WebSocket):
                     "timestamp": int(time.time() * 1000),
                     "callSid": current_call_sid,
                 }, current_call_sid)
+        except Exception:
+            pass
+
+        # ✅ Cleanup ElevenLabs
+        try:
+            await elevenlabs_service.disconnect()
         except Exception:
             pass
 
