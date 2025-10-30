@@ -542,39 +542,6 @@ async def handle_media_stream(websocket: WebSocket):
             NOTE: Currently not used - events go to handle_other_openai_event.
             """
             pass  # Not called in current architecture
-                                        
-                                        # Broadcast transcript to dashboard
-                                        if openai_service.ai_transcript_callback:
-                                            try:
-                                                await openai_service.ai_transcript_callback({
-                                                    "speaker": "AI",
-                                                    "text": text,
-                                                    "timestamp": int(time.time() * 1000)
-                                                })
-                                            except Exception as e:
-                                                Log.error(f"Failed to broadcast transcript: {e}")
-                
-                # Handle incremental text deltas (if OpenAI sends them in streaming mode)
-                elif etype == 'response.text.delta':
-                    delta = response.get('delta', '')
-                    if delta:
-                        Log.debug(f"[OpenAI→Text] Delta: '{delta}'")
-                        # Add to buffer and potentially send to ElevenLabs
-                        await text_buffer.add_text_delta(delta, connection_manager)
-                
-                # Handle complete text responses (alternative format)
-                elif etype == 'response.text.done':
-                    text = response.get('text', '')
-                    if text:
-                        Log.info(f"[OpenAI→Text] Complete: '{text[:60]}...'")
-                        # Send complete text to ElevenLabs
-                        await text_buffer.add_text_delta(text, connection_manager)
-                        await text_buffer.flush(connection_manager)
-                        
-            except Exception as e:
-                Log.error(f"[Text→ElevenLabs] Error: {e}")
-                import traceback
-                Log.error(traceback.format_exc())
 
         async def handle_speech_started():
             """Handle user speech interruption."""
