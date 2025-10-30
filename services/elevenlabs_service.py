@@ -38,9 +38,10 @@ class ElevenLabsStreamingService:
             try:
                 Log.info("[ElevenLabs] Connecting to WebSocket...")
                 
+                # ✅ FIXED: Use 'additional_headers' instead of 'extra_headers'
                 self.ws_connection = await websockets.connect(
                     self.ws_url,
-                    extra_headers={
+                    additional_headers={
                         "xi-api-key": self.api_key
                     },
                     ping_interval=20,
