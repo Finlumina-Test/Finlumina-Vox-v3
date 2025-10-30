@@ -541,52 +541,66 @@ async def handle_media_stream(websocket: WebSocket):
             This replaces the old handle_audio_delta function.
             """
             try:
+                etype = response.get('type')
+                Log.info(f"[handle_text_delta] 🔍 Received event type: {etype}")
+                
                 # Skip if human has taken over
                 if openai_service.is_human_in_control():
                     Log.debug("[Text] Skipping AI text - human takeover active")
                     return
                 
-                etype = response.get('type')
-                
                 # ✅ PRIMARY FIX: Handle response.done with text content
                 if etype == 'response.done':
+                    Log.info(f"[handle_text_delta] 🎯 Processing response.done")
                     resp = response.get('response') or {}
                     
                     # Check if response was completed successfully
                     status = resp.get('status')
+                    Log.info(f"[handle_text_delta] Response status: {status}")
+                    
                     if status != 'completed':
                         Log.debug(f"[Text] Skipping non-completed response: {status}")
                         return
                     
                     output = resp.get('output') or []
+                    Log.info(f"[handle_text_delta] Found {len(output)} output items")
                     
                     for item in output:
                         if not isinstance(item, dict):
                             continue
                         
+                        item_type = item.get('type')
+                        item_role = item.get('role')
+                        Log.info(f"[handle_text_delta] Output item - type: {item_type}, role: {item_role}")
+                        
                         # Extract text from message content
-                        if item.get('type') == 'message' and item.get('role') == 'assistant':
+                        if item_type == 'message' and item_role == 'assistant':
                             content = item.get('content') or []
+                            Log.info(f"[handle_text_delta] Found assistant message with {len(content)} content items")
                             
                             for c in content:
                                 if not isinstance(c, dict):
                                     continue
                                 
+                                content_type = c.get('type')
+                                Log.info(f"[handle_text_delta] Content type: {content_type}")
+                                
                                 # ✅ Get text from output_text (this is what OpenAI sends in text mode)
-                                if c.get('type') == 'output_text':
+                                if content_type == 'output_text':
                                     text = c.get('text', '')
                                     if text and text.strip():
-                                        Log.info(f"[OpenAI→ElevenLabs] Converting: '{text[:60]}...'")
+                                        Log.info(f"[OpenAI→ElevenLabs] 🎯 FOUND TEXT: '{text[:60]}...'")
                                         
                                         # ✅ Send to ElevenLabs for voice generation
                                         try:
+                                            Log.info(f"[OpenAI→ElevenLabs] Calling send_to_twilio_realtime...")
                                             await elevenlabs_service.send_to_twilio_realtime(
                                                 text,
                                                 connection_manager
                                             )
                                             Log.info(f"[OpenAI→ElevenLabs] ✅ Sent successfully")
                                         except Exception as e:
-                                            Log.error(f"[OpenAI→ElevenLabs] Failed to send: {e}")
+                                            Log.error(f"[OpenAI→ElevenLabs] ❌ Failed to send: {e}")
                                             import traceback
                                             Log.error(traceback.format_exc())
                                         
@@ -637,6 +651,9 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def handle_other_openai_event(response: dict):
             """Handle other OpenAI events."""
+            etype = response.get('type')
+            Log.info(f"[handle_other_openai_event] 🔍 Received event type: {etype}")
+            
             openai_service.process_event_for_logging(response)
             await openai_service.extract_caller_transcript(response)
             
